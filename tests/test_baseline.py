@@ -108,6 +108,15 @@ class BaselineTest(unittest.TestCase):
         issues = [task("org__repo-1"), task("org__repo-2")]
         selected = development_subset(issues, 10, 17)
         self.assertIn(len(selected), (0, 2))
+        rebench = [
+            "org__repo-" + "a" * 40 + "-v" + "b" * 40,
+            "org__repo-" + "c" * 40 + "-v" + "d" * 40,
+            "org__repo-" + "e" * 40,
+        ]
+        self.assertEqual(len({_held_out(task_id) for task_id in rebench}), 1)
+        self.assertEqual(_held_out("org__scikit-learn-12"), _held_out("org__scikit-learn-99"))
+        with self.assertRaisesRegex(ValueError, "cannot prevent repository leakage"):
+            _held_out("org__unrecognized-task")
 
     def test_development_load_does_not_require_heldout_snapshots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +188,9 @@ class BaselineTest(unittest.TestCase):
             self.assertTrue(report["checks"]["issue_map_hash_recorded"])
             self.assertTrue(report["checks"]["benchmark_hash_matches"])
             self.assertTrue(report["checks"]["results_hash_matches"])
+            self.assertTrue(report["checks"]["split_version_known"])
+            self.assertTrue(report["checks"]["split_respects_holdout"])
+            self.assertFalse(report["checks"]["formal_run_uses_heldout_repositories"])
             self.assertFalse(report["checks"]["contextbench_generalization_included"])
             paper = render_report(summary, [], report)
             self.assertIn("## 10. Limitations", paper)
@@ -192,11 +204,15 @@ class BaselineTest(unittest.TestCase):
             )
             (root / "test_cache.py").write_text("from cache import Cache\n", encoding="utf-8")
             tools = RepositoryTools(root)
+            self.assertEqual(tools.index["cache.py"].language, "python")
+            self.assertEqual(tools.index["cache.py"].symbols["Cache"], [(1, 3)])
+            self.assertEqual(tools.index["cache.py"].symbols["expire"], [(2, 3)])
             search = tools.call("SEARCH_TEXT", {"query": "expire"})
             self.assertTrue(search["lines"])
             self.assertNotIn("matches", search)
             symbol = tools.call("SEARCH_SYMBOL", {"symbol": "Cache"})["lines"][0]
             self.assertEqual(symbol["path"], "cache.py")
+            self.assertEqual(symbol["end_line"], 3)
             self.assertTrue(symbol["text"])
             self.assertTrue(tools.call("OPEN", {"file": "cache.py", "start_line": 1, "end_line": 2})["lines"])
             self.assertEqual(len(tools.call("FIND_REFERENCES", {"symbol": "Cache"})["lines"]), 2)
@@ -206,6 +222,34 @@ class BaselineTest(unittest.TestCase):
             tools.call("STOP")
             with self.assertRaises(RuntimeError):
                 tools.call("SEARCH_TEXT", {"query": "Cache"})
+            self.assertEqual(tools.logs[-1]["error"]["type"], "RuntimeError")
+
+    def test_trajectory_metrics_cover_quality_cost_and_behavior(self):
+        trajectory = [
+            {"decision": "SEARCH", "action": "SEARCH_TEXT", "arguments": {},
+             "context_tokens_returned": 2, "result": {"lines": [
+                 {"path": "cache.py", "line": 1, "text": "class Cache:"},
+                 {"path": "cache.py", "line": 2, "text": "    def expire(self):"},
+             ]}},
+            {"decision": "SEARCH", "action": "OPEN", "arguments": {"file": "cache.py"},
+             "context_tokens_returned": 2, "result": {"lines": [
+                 {"path": "cache.py", "line": 2, "text": "    def expire(self):"},
+                 {"path": "cache.py", "line": 3, "text": "        return True"},
+             ]}},
+        ]
+        metrics = evaluate_trajectory(
+            trajectory, [Region("cache.py", 1, 3)],
+            tool_usage=[{}, {}, {}], stop_reason="sufficient_context",
+        )
+        self.assertEqual(metrics["span_recall"], 1.0)
+        self.assertEqual(metrics["precision"], 1.0)
+        self.assertEqual(metrics["tool_calls"], 3.0)
+        self.assertEqual(metrics["search_calls"], 1.0)
+        self.assertEqual(metrics["files_opened"], 1.0)
+        self.assertEqual(metrics["duplicate_reads"], 1.0)
+        self.assertEqual(metrics["context_tokens_read"], 4.0)
+        self.assertEqual(metrics["information_gain_per_step"], 1.5)
+        self.assertEqual(metrics["stop_reason"], "sufficient_context")
 
     def test_fixed_budget_agent_trajectory_replays(self):
         class FakeClient:
@@ -230,6 +274,19 @@ class BaselineTest(unittest.TestCase):
             replayed = replay_trajectory(root, result["trajectory"])
             self.assertEqual(replayed, [event["result"] for event in result["trajectory"]])
 
+            class StopClient:
+                def __init__(self):
+                    self.calls = 0
+
+                def complete(self, messages):
+                    self.calls += 1
+                    return '{"action":"STOP","arguments":{}}'
+
+            stop_client = StopClient()
+            with self.assertRaisesRegex(ValueError, "invalid tool decision"):
+                FixedBudgetAgent(stop_client).run("Cache problem", root, 3)
+            self.assertEqual(stop_client.calls, 1)
+
     def test_repopilot_tracks_state_and_stops_adaptively(self):
         class FakeClient:
             def __init__(self):
@@ -237,8 +294,8 @@ class BaselineTest(unittest.TestCase):
                     json.dumps({
                         "decision": "SEARCH", "hypothesis": "Cache expiration path",
                         "known_facts": [], "relevant_spans": [], "unresolved_questions": ["Where is expiration handled?"],
-                        "confidence": 0.4, "expected_gain": "Find Cache", "action": "SEARCH_TEXT",
-                        "arguments": {"query": "Cache"},
+                        "confidence": 0.4, "expected_gain": "Inspect Cache", "action": "OPEN",
+                        "arguments": {"file": "cache.py", "start_line": 1, "end_line": 2},
                     }),
                     json.dumps({
                         "decision": "STOP", "hypothesis": "Found candidate", "known_facts": ["Cache is defined here."],
@@ -259,9 +316,14 @@ class BaselineTest(unittest.TestCase):
             client = FakeClient()
             result = RepoPilot(client).run("Cache expiration", root, token_budget=20, max_steps=5)
             self.assertEqual(result["stop_reason"], "sufficient_context")
-            self.assertEqual(result["budget_used"], 2)
-            self.assertEqual(result["trajectory"][0]["context_tokens_returned"], 2)
+            self.assertEqual(result["budget_used"], 3)
+            self.assertEqual(result["trajectory"][0]["context_tokens_returned"], 3)
             self.assertEqual(result["trajectory"][0]["state"]["candidate_files"], ["cache.py"])
+            self.assertEqual(result["trajectory"][0]["state"]["inspected_spans"], [
+                {"path": "cache.py", "start": 1, "end": 2},
+            ])
+            self.assertEqual(result["trajectory"][0]["state"]["budget_remaining"], 17)
+            self.assertEqual(result["trajectory"][1]["state"]["known_facts"], ["Cache is defined here."])
             self.assertEqual(client.messages[1][-1]["role"], "user")
 
     def test_adaptive_stop_ablation_forces_a_search_action(self):
@@ -281,6 +343,76 @@ class BaselineTest(unittest.TestCase):
             result = RepoPilot(FakeClient()).run("Cache", root, 10, max_steps=1, ablation="no_adaptive_stop")
             self.assertEqual(result["actions_attempted"], 1)
             self.assertEqual(result["trajectory"][0]["action"], "SEARCH_TEXT")
+
+    def test_repopilot_deduplicates_open_spans_and_caps_context_budget(self):
+        class FakeClient:
+            def __init__(self):
+                self.outputs = iter([
+                    json.dumps({"decision": "SEARCH", "action": "OPEN",
+                                "arguments": {"file": "cache.py", "start_line": 1, "end_line": 2}}),
+                    json.dumps({"decision": "SEARCH", "action": "OPEN",
+                                "arguments": {"file": "cache.py", "start_line": 1, "end_line": 3}}),
+                    json.dumps({"decision": "STOP", "stop_reason": "sufficient_context"}),
+                ])
+
+            def complete(self, messages):
+                return next(self.outputs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cache.py").write_text(
+                "class Cache:\n    def expire(self):\n        return True\n", encoding="utf-8",
+            )
+            result = RepoPilot(FakeClient()).run("Cache expiration", root, token_budget=6, max_steps=5)
+            self.assertEqual(result["stop_reason"], "sufficient_context")
+            self.assertEqual(result["budget_used"], 5)
+            self.assertEqual(result["trajectory"][1]["context_tokens_returned"], 0)
+            self.assertEqual(result["trajectory"][1]["state"]["inspected_spans"], [
+                {"path": "cache.py", "start": 1, "end": 2},
+            ])
+            self.assertEqual(result["tool_usage"][1]["arguments"], {
+                "file": "cache.py", "start_line": 3, "end_line": 3,
+            })
+
+    def test_repopilot_stops_on_budget_exhaustion_and_no_information_gain(self):
+        class BudgetClient:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages):
+                self.calls += 1
+                return json.dumps({"decision": "SEARCH", "action": "SEARCH_TEXT",
+                                   "arguments": {"query": "Cache"}})
+
+        class NoGainClient:
+            def __init__(self):
+                self.outputs = iter([
+                    json.dumps({"decision": "SEARCH", "action": "SEARCH_TEXT",
+                                "arguments": {"query": "missing text"}}),
+                    json.dumps({"decision": "SEARCH", "action": "SEARCH_SYMBOL",
+                                "arguments": {"symbol": "MissingSymbol"}}),
+                    json.dumps({"decision": "SEARCH", "action": "FIND_TESTS",
+                                "arguments": {"target": "MissingTarget"}}),
+                ])
+
+            def complete(self, messages):
+                return next(self.outputs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cache.py").write_text("Cache\n", encoding="utf-8")
+            client = BudgetClient()
+            exhausted = RepoPilot(client).run("Cache", root, token_budget=1, max_steps=5)
+            self.assertEqual(exhausted["stop_reason"], "budget_exhausted")
+            self.assertEqual(exhausted["budget_used"], 1)
+            self.assertEqual(client.calls, 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_repo = Path(tmp)
+            no_gain = RepoPilot(NoGainClient()).run("Find missing code", empty_repo, 20, max_steps=5)
+            self.assertEqual(no_gain["stop_reason"], "no_information_gain")
+            self.assertEqual(no_gain["actions_attempted"], 3)
+            self.assertTrue(all(not event["result"]["lines"] for event in no_gain["trajectory"]))
 
 
 if __name__ == "__main__":

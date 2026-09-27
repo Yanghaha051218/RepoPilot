@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 from .agent import REPOPILOT_PROMPT, SYSTEM_PROMPT
-from .benchmark import ExplorationTask, Region, _held_out
+from .benchmark import ExplorationTask, HELDOUT_SPLIT_VERSION, Region, _held_out
 from .experiments import _source_hash, run_experiments
 
 REQUIRED_ARMS = {
@@ -124,7 +124,7 @@ def verify_frozen_m9(summary_path: Path, results_path: Path, bench_path: Path):
         "fixed_agent": hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest(),
         "repopilot": hashlib.sha256(REPOPILOT_PROMPT.encode()).hexdigest(),
     }
-    if summary.get("split_version") != "repopilot-heldout-v2":
+    if summary.get("split_version") != HELDOUT_SPLIT_VERSION:
         raise ValueError("frozen artifact is not an M9 SWE-Explore held-out run")
     if config.get("prompts_sha256") != prompts:
         raise ValueError("M9 prompt hashes do not match the current prompts")

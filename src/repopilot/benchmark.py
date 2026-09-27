@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+DEVELOPMENT_SPLIT_VERSION = "repopilot-development-v3"
+HELDOUT_SPLIT_VERSION = "repopilot-heldout-v3"
+
 
 @dataclass(frozen=True)
 class Region:
@@ -183,10 +186,18 @@ def development_subset(tasks: Iterable[ExplorationTask], limit: int, seed: int) 
 
 
 def _held_out(task_id: str) -> bool:
-    # SWE-style IDs are owner__repo-issue; all issues from a repository stay together.
+    """Keep every task from one repository in the same deterministic split."""
     if "__" not in task_id:
         return False
-    owner, repository = task_id.split("__", 1)
-    repository = owner + "/" + repository.rsplit("-", 1)[0]
-    key = hashlib.sha256(("repopilot-heldout-v2|" + repository).encode("utf-8")).digest()
+    owner, identifier = task_id.split("__", 1)
+    rebench = re.fullmatch(
+        r"(?P<repo>.+?)-[0-9a-fA-F]{40}(?:-v(?:[0-9a-fA-F]{40}|nan))?",
+        identifier,
+    )
+    issue = re.fullmatch(r"(?P<repo>.+)-\d+", identifier)
+    match = rebench or issue
+    if not owner or not match:
+        raise ValueError("unrecognized SWE-style task ID; cannot prevent repository leakage")
+    repository = owner + "/" + match.group("repo")
+    key = hashlib.sha256((HELDOUT_SPLIT_VERSION + "|" + repository.lower()).encode("utf-8")).digest()
     return int.from_bytes(key[:4], "big") % 5 == 0

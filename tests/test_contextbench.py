@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from repopilot.agent import REPOPILOT_PROMPT, SYSTEM_PROMPT
-from repopilot.benchmark import _held_out, mapping_sha256
+from repopilot.benchmark import HELDOUT_SPLIT_VERSION, _held_out, mapping_sha256
 from repopilot.contextbench import REQUIRED_ARMS, load_contextbench_tasks, run_contextbench, verify_frozen_m9
 from repopilot.experiments import _source_hash
 
@@ -65,7 +65,7 @@ class ContextBenchTest(unittest.TestCase):
             "benchmark_sha256": hashlib.sha256(bench_path.read_bytes()).hexdigest(),
             "issue_map_sha256": mapping_sha256({}),
             "results_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
-            "seed": 17, "split_version": "repopilot-heldout-v2",
+            "seed": 17, "split_version": HELDOUT_SPLIT_VERSION,
             "evaluation_task_ids": [task_id],
             "failed_runs": 0,
             "config": {

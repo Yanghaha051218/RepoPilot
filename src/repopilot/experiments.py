@@ -6,7 +6,9 @@ from collections import defaultdict
 from pathlib import Path
 
 from .agent import FixedBudgetAgent, RepoPilot, REPOPILOT_PROMPT, SYSTEM_PROMPT
-from .benchmark import load_split_tasks, mapping_sha256
+from .benchmark import (
+    DEVELOPMENT_SPLIT_VERSION, HELDOUT_SPLIT_VERSION, load_split_tasks, mapping_sha256,
+)
 from .evaluation import evaluate, evaluate_trajectory
 from .retrieval import chunks, retrieve, tokenize
 
@@ -48,9 +50,7 @@ def classify_failure(metrics, trajectory, gold):
     return None
 
 
-def _select_static(method, task, corpus, token_budget, seed):
-    max_lines = sum(chunk.end - chunk.start + 1 for chunk in corpus)
-    ranked = retrieve(method, task.issue_text, corpus, task.task_id, max_lines, seed=seed)
+def _select_static(task, corpus, token_budget, ranked):
     by_key = {(chunk.path, chunk.start): chunk for chunk in corpus}
     selected, used_tokens = [], 0
     for region in ranked:
@@ -149,10 +149,16 @@ def run_experiments(
     with output.open("w", encoding="utf-8") as sink:
         for task in tasks:
             corpus = chunks(Path(task.repo_dir))
+            max_lines = sum(chunk.end - chunk.start + 1 for chunk in corpus)
+            ranked_static = {}
             for budget in token_budgets:
                 for method in STATIC_METHODS:
                     try:
-                        regions, token_cost = _select_static(method, task, corpus, budget, seed)
+                        if method not in ranked_static:
+                            ranked_static[method] = retrieve(
+                                method, task.issue_text, corpus, task.task_id, max_lines, seed=seed,
+                            )
+                        regions, token_cost = _select_static(task, corpus, budget, ranked_static[method])
                         metrics = evaluate(regions, task.gold_spans, sum(r.end - r.start + 1 for r in regions))
                         metrics["context_tokens_read"] = float(token_cost)
                         record = {
@@ -219,8 +225,8 @@ def run_experiments(
         "issue_map_sha256": mapping_sha256(issue_map),
         "source_sha256": _source_hash(),
         "seed": seed,
-        "split_version": {"development": "repopilot-development-v2",
-                          "heldout": "repopilot-heldout-v2",
+        "split_version": {"development": DEVELOPMENT_SPLIT_VERSION,
+                          "heldout": HELDOUT_SPLIT_VERSION,
                           "contextbench": "contextbench-all-v1"}[selected_split],
         "token_budget_definition": "lexical token approximation over returned code text",
         "config": {"fixed_steps": fixed_steps, "max_steps": max_steps, "token_budgets": list(token_budgets),

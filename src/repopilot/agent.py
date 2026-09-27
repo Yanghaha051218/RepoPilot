@@ -150,6 +150,7 @@ class RepoPilot:
             action, arguments = decision.get("action"), decision.get("arguments")
             if action not in available or not isinstance(arguments, dict):
                 raise ValueError("SEARCH decision requires an enabled action and arguments object")
+            # ponytail: deduplicate exact actions only; normalize equivalent queries if loops warrant it.
             signature = json.dumps([action, arguments], sort_keys=True)
             previous = {json.dumps([event.get("action"), event.get("arguments")], sort_keys=True)
                         for event in state.previous_actions}
@@ -190,7 +191,7 @@ class RepoPilot:
                         result = {"lines": rows}
                     else:
                         result = tools.call(action, arguments)
-                        result["lines"] = _truncate_lines(result.get("lines", []), state.budget_remaining)
+                    result["lines"] = _truncate_lines(result.get("lines", []), state.budget_remaining)
                     gained = _context_tokens(result)
                     event = {"step": step, "action": action, "arguments": arguments,
                              "decision": "SEARCH", "expected_gain": decision.get("expected_gain", ""),

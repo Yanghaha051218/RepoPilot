@@ -5,13 +5,15 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .benchmark import Region
 
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|\d+")
+# ponytail: non-Python symbols get declaration-line spans; add parsers when full ranges matter.
 SYMBOL = re.compile(r"\b(?:class|def|function|func|struct|interface|enum|type)\s+([A-Za-z_]\w*)")
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", "__pycache__", ".venv"}
+# ponytail: cap indexed files at 1 MB to bound memory; stream larger files if a task needs them.
 MAX_FILE_BYTES = 1_000_000
 MAX_RESULTS = 50
 MAX_OPEN_LINES = 200
@@ -20,8 +22,9 @@ MAX_OPEN_LINES = 200
 @dataclass(frozen=True)
 class FileIndex:
     path: str
+    language: str
     line_count: int
-    symbols: Dict[str, List[int]]
+    symbols: Dict[str, List[Tuple[int, int]]]
     imports: List[str]
 
 
@@ -50,25 +53,37 @@ class RepositoryTools:
                 continue
             rel = path.relative_to(self.root).as_posix()
             lines = text.splitlines()
-            symbols: Dict[str, List[int]] = {}
+            symbols: Dict[str, List[Tuple[int, int]]] = {}
             imports = []
-            for number, line in enumerate(lines, 1):
-                for match in SYMBOL.finditer(line):
-                    symbols.setdefault(match.group(1), []).append(number)
-            if path.suffix == ".py":
+            python_file = path.suffix.lower() in (".py", ".pyi")
+            if not python_file:
+                for number, line in enumerate(lines, 1):
+                    for match in SYMBOL.finditer(line):
+                        symbols.setdefault(match.group(1), []).append((number, number))
+            if python_file:
                 try:
                     tree = ast.parse(text)
                     for node in ast.walk(tree):
                         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                            symbols.setdefault(node.name, []).append(node.lineno)
+                            symbols.setdefault(node.name, []).append(
+                                (node.lineno, getattr(node, "end_lineno", node.lineno))
+                            )
                         elif isinstance(node, ast.Import):
                             imports.extend(alias.name for alias in node.names)
                         elif isinstance(node, ast.ImportFrom) and node.module:
                             imports.append(node.module)
                 except SyntaxError:
-                    pass
+                    for number, line in enumerate(lines, 1):
+                        for match in SYMBOL.finditer(line):
+                            symbols.setdefault(match.group(1), []).append((number, number))
             self.files[rel] = text
-            self.index[rel] = FileIndex(rel, len(lines), {name: sorted(set(rows)) for name, rows in symbols.items()}, sorted(set(imports)))
+            suffix = path.suffix.lower()
+            language = "python" if suffix in (".py", ".pyi") else suffix.lstrip(".") or "unknown"
+            self.index[rel] = FileIndex(
+                rel, language, len(lines),
+                {name: sorted(set(rows)) for name, rows in symbols.items()},
+                sorted(set(imports)),
+            )
 
     def _query(self, value: object, name: str) -> str:
         if not isinstance(value, str) or not value.strip() or len(value) > 500:
@@ -90,12 +105,30 @@ class RepositoryTools:
         return result
 
     def call(self, action: str, arguments: Optional[dict] = None) -> dict:
-        arguments = arguments or {}
+        started = time.perf_counter()
+        log_count = len(self.logs)
+        try:
+            return self._execute(action, arguments, started)
+        except Exception as exc:
+            if len(self.logs) == log_count:
+                self.logs.append({
+                    "action": action,
+                    "arguments": {} if arguments is None else arguments,
+                    "result": {"error": str(exc), "lines": []},
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "lines_returned": 0,
+                    "tokens_returned": 0,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                })
+            raise
+
+    def _execute(self, action: str, arguments: Optional[dict], started: float) -> dict:
+        if arguments is None:
+            arguments = {}
         if not isinstance(arguments, dict):
             raise ValueError("tool arguments must be an object")
         if self.stopped:
             raise RuntimeError("exploration has stopped")
-        started = time.perf_counter()
         if action == "SEARCH_TEXT":
             query = self._query(arguments.get("query"), "query")
             matches = []
@@ -114,8 +147,9 @@ class RepositoryTools:
             for path, entry in self.index.items():
                 if query in entry.symbols:
                     lines = self.files[path].splitlines()
-                    matches.extend({"path": path, "line": line, "symbol": query,
-                                    "text": lines[line - 1]} for line in entry.symbols[query])
+                    matches.extend({"path": path, "line": start, "end_line": end,
+                                    "symbol": query, "text": lines[start - 1]}
+                                   for start, end in entry.symbols[query])
             matches = matches[:MAX_RESULTS]
             return self._record(action, {"symbol": query}, {"lines": matches}, started)
         if action == "OPEN":

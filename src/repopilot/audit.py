@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from .agent import REPOPILOT_PROMPT, SYSTEM_PROMPT
-from .benchmark import _held_out
+from .benchmark import DEVELOPMENT_SPLIT_VERSION, HELDOUT_SPLIT_VERSION, _held_out
 from .experiments import _source_hash
 
 
@@ -25,7 +25,7 @@ def audit_experiment(bench: Path, results: Path, summary_path: Path) -> dict:
     checks["source_hash_matches"] = _source_hash() == summary.get("source_sha256")
     checks["failed_runs_retained"] = sum(row.get("status") == "failed" for row in rows) == summary.get("failed_runs")
     split_version = summary.get("split_version")
-    if split_version == "repopilot-heldout-v2":
+    if split_version == HELDOUT_SPLIT_VERSION:
         task_ids = set(summary.get("evaluation_task_ids", []))
     else:
         task_ids = set(summary.get("development_task_ids", []))
@@ -34,11 +34,11 @@ def audit_experiment(bench: Path, results: Path, summary_path: Path) -> dict:
     checks["task_manifest_unique"] = len(task_ids) == len(
         summary.get("development_task_ids", summary.get("evaluation_task_ids", []))
     )
-    checks["split_version_known"] = split_version in ("repopilot-development-v2", "repopilot-heldout-v2")
-    checks["formal_run_uses_heldout_repositories"] = split_version == "repopilot-heldout-v2"
-    if split_version == "repopilot-development-v2":
+    checks["split_version_known"] = split_version in (DEVELOPMENT_SPLIT_VERSION, HELDOUT_SPLIT_VERSION)
+    checks["formal_run_uses_heldout_repositories"] = split_version == HELDOUT_SPLIT_VERSION
+    if split_version == DEVELOPMENT_SPLIT_VERSION:
         checks["split_respects_holdout"] = not any(_held_out(task_id) for task_id in task_ids)
-    elif split_version == "repopilot-heldout-v2":
+    elif split_version == HELDOUT_SPLIT_VERSION:
         checks["split_respects_holdout"] = bool(task_ids) and all(_held_out(task_id) for task_id in task_ids)
     else:
         checks["split_respects_holdout"] = False
